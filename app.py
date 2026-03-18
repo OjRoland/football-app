@@ -1,73 +1,93 @@
 import streamlit as st
 import requests
 
-st.set_page_config(page_title="Football AI", layout="centered")
+st.set_page_config(page_title="Football AI", layout="centered", page_icon="⚽")
 
 st.title("⚽ Football AI Betting App")
 
-# 🔑 Your API Key (we’ll replace this later with secrets)
-API_KEY = "PASTE_YOUR_ODDS_API_KEY_HERE"
+# 🔑 Use Streamlit Secrets for your API key in production!
+API_KEY = st.sidebar.text_input("Enter Odds API Key", type="password")
+bankroll = st.sidebar.number_input("Enter your bankroll (£)", value=1000, step=100)
 
-# 💰 Bankroll input
-bankroll = st.number_input("Enter your bankroll (£)", value=1000)
-
-# 📊 Kelly formula
 def kelly(prob, odds):
     b = odds - 1
     q = 1 - prob
+    # Standard Kelly formula
     f = (b * prob - q) / b
-    return max(f, 0) * 0.25  # 25% safer Kelly
+    # Fractional Kelly (0.25) to reduce volatility/risk of ruin
+    return max(f, 0) * 0.25 
 
-# 🤖 Fake prediction (we’ll improve later)
 def predict(home, away):
-    return {
-        "home_win": 0.45,
-        "draw": 0.25,
-        "away_win": 0.30
-    }
+    # TODO: This is where your ML model will eventually go
+    return {"home_win": 0.45, "draw": 0.25, "away_win": 0.30}
 
-# 🌍 Fetch EPL odds (you can expand later)
 def get_matches():
-    url = f"https://api.the-odds-api.com/v4/sports/soccer_epl/odds/?apiKey={API_KEY}&regions=eu&markets=h2h"
-    res = requests.get(url)
-    return res.json()
+    if not API_KEY:
+        st.warning("Please enter your API Key in the sidebar.")
+        return []
+    
+    # Using 'uk' as a region often gives better coverage for EPL
+    url = f"https://api.the-odds-api.com/v4/sports/soccer_epl/odds/?apiKey={API_KEY}&regions=uk&markets=h2h&oddsFormat=decimal"
+    
+    try:
+        res = requests.get(url)
+        res.raise_for_status() # Check for 401 (invalid key) or 429 (out of credits)
+        return res.json()
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
+        return []
 
-# ▶️ Button
-if st.button("Load Matches"):
-
+if st.button("Load & Analyze Matches"):
     matches = get_matches()
-
+    
+    if not matches:
+        st.info("No matches found or API key is missing.")
+    
     for game in matches:
+        # 🛡️ Safety Check: Ensure bookmakers data exists
+        if not game.get("bookmakers"):
+            continue
 
         try:
             home = game["home_team"]
             away = game["away_team"]
+            
+            # Get the first available bookie and market
+            market = game["bookmakers"][0]["markets"][0]
+            outcomes = market["outcomes"] # List of 3 outcomes (Home, Away, Draw)
 
-            odds = game["bookmakers"][0]["markets"][0]["outcomes"]
+            # Map the outcomes by name to ensure we don't mix up Home/Away odds
+            odds_dict = {o['name']: o['price'] for o in outcomes}
+            home_odds = odds_dict.get(home)
+            away_odds = odds_dict.get(away)
 
-            home_odds = odds[0]["price"]
-            away_odds = odds[1]["price"]
+            if not home_odds or not away_odds:
+                continue
 
             probs = predict(home, away)
+            
+            # Calculate Expected Value (EV)
+            # EV = (Probability * Odds) - 1
+            home_ev = (probs["home_win"] * home_odds) - 1
+            away_ev = (probs["away_win"] * away_odds) - 1
 
-            home_edge = probs["home_win"] * home_odds - 1
-            away_edge = probs["away_win"] * away_odds - 1
+            with st.expander(f"📊 {home} vs {away}", expanded=True):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write(f"**Model Probs:** H: {probs['home_win']:.2%} | A: {probs['away_win']:.2%}")
+                    st.write(f"**Market Odds:** H: {home_odds} | A: {away_odds}")
 
-            st.markdown(f"## {home} vs {away}")
+                with col2:
+                    if home_ev > 0:
+                        stake = bankroll * kelly(probs["home_win"], home_odds)
+                        st.success(f"🎯 VALUE HOME: Stake £{stake:.2f} (EV: {home_ev:+.2f})")
+                    elif away_ev > 0:
+                        stake = bankroll * kelly(probs["away_win"], away_odds)
+                        st.success(f"🎯 VALUE AWAY: Stake £{stake:.2f} (EV: {away_ev:+.2f})")
+                    else:
+                        st.info("No value found.")
 
-            st.write("Home Win %:", probs["home_win"])
-            st.write("Draw %:", probs["draw"])
-            st.write("Away Win %:", probs["away_win"])
-
-            if home_edge > 0:
-                stake = bankroll * kelly(probs["home_win"], home_odds)
-                st.success(f"VALUE BET: HOME | Stake £{stake:.2f}")
-
-            if away_edge > 0:
-                stake = bankroll * kelly(probs["away_win"], away_odds)
-                st.success(f"VALUE BET: AWAY | Stake £{stake:.2f}")
-
-            st.divider()
-
-        except:
+        except (KeyError, IndexError):
             continue
+            
