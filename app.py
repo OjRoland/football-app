@@ -6,7 +6,7 @@ st.set_page_config(page_title="Football AI", layout="centered", page_icon="⚽")
 st.title("⚽ Football AI Betting App")
 
 # 🔑 Use Streamlit Secrets for your API key in production!
-API_KEY = st.sidebar.text_input("Enter Odds API Key", type="8709a1ec893100ad600d2b7d25b782a5")
+API_KEY = st.secrets["API_KEY"]
 bankroll = st.sidebar.number_input("Enter your bankroll (£)", value=1000, step=100)
 
 def kelly(prob, odds):
