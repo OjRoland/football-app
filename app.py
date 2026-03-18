@@ -1,39 +1,131 @@
 import streamlit as st
 import requests
+import sqlite3
+import pandas as pd
+from scipy.stats import poisson
 
-st.set_page_config(page_title="Football AI", layout="centered", page_icon="⚽")
+# --- 🛠️ CONFIG & DATABASE ---
+DB_NAME = "bets_tracker.db"
 
-st.title("⚽ Football AI Betting App")
+# Pulling keys directly from Secrets
+API_KEY = st.secrets["ODDS_API_KEY"]
+TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
 
-# 🔑 Use Streamlit Secrets for your API key in production!
-API_KEY = st.secrets["API_KEY"]
-bankroll = st.sidebar.number_input("Enter your bankroll (£)", value=1000, step=100)
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS bets 
+                 (id INTEGER PRIMARY KEY, event TEXT, selection TEXT, odds REAL, stake REAL, status TEXT)''')
+    conn.commit()
+    conn.close()
 
-def kelly(prob, odds):
-    b = odds - 1
-    q = 1 - prob
-    # Standard Kelly formula
-    f = (b * prob - q) / b
-    # Fractional Kelly (0.25) to reduce volatility/risk of ruin
-    return max(f, 0) * 0.25 
+init_db()
 
-def predict(home, away):
-    # TODO: This is where your ML model will eventually go
-    return {"home_win": 0.45, "draw": 0.25, "away_win": 0.30}
-
-def get_matches():
-    if not API_KEY:
-        st.warning("Please enter your API Key in the sidebar.")
-        return []
+# --- 🤖 AI PREDICTION ENGINE (Poisson Distribution) ---
+def get_poisson_probs(home_avg, away_avg):
+    """Calculates win/draw/loss probabilities."""
+    max_goals = 8 
+    home_probs = [poisson.pmf(i, home_avg) for i in range(max_goals)]
+    away_probs = [poisson.pmf(i, away_avg) for i in range(max_goals)]
     
-    # Using 'uk' as a region often gives better coverage for EPL
-    url = f"https://api.the-odds-api.com/v4/sports/soccer_epl/odds/?apiKey={API_KEY}&regions=uk&markets=h2h&oddsFormat=decimal"
-    
+    p_home, p_draw, p_away = 0, 0, 0
+    for h in range(max_goals):
+        for a in range(max_goals):
+            prob = home_probs[h] * away_probs[a]
+            if h > a: p_home += prob
+            elif h < a: p_away += prob
+            else: p_draw += prob
+    return {"home": p_home, "draw": p_draw, "away": p_away}
+
+# --- 🚀 TELEGRAM ALERTS ---
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={message}"
     try:
-        res = requests.get(url)
-        res.raise_for_status() # Check for 401 (invalid key) or 429 (out of credits)
-        return res.json()
-    except Exception as e:
+        requests.get(url)
+    except:
+        st.error("Failed to send Telegram alert.")
+
+# --- 📊 UI SETUP ---
+st.set_page_config(page_title="Football AI Pro", layout="wide", page_icon="⚽")
+st.title("🏆 Football AI: Value Betting Suite")
+
+# Sidebar for global settings
+bankroll = st.sidebar.number_input("Total Bankroll (£)", value=1000)
+risk_factor = st.sidebar.slider("Kelly Fraction (Risk)", 0.01, 0.1, 0.05)
+
+tabs = st.tabs(["🎯 Live Value Scraper", "📈 My Bet Tracker"])
+
+# --- TAB 1: LIVE VALUE ---
+with tabs[0]:
+    leagues = {
+        "🏴󠁧󠁢󠁥󠁮󠁧󠁿 EPL": "soccer_epl",
+        "🇪🇸 La Liga": "soccer_spain_la_liga",
+        "🇩🇪 Bundesliga": "soccer_germany_bundesliga",
+        "🇮🇹 Serie A": "soccer_italy_serie_a",
+        "🇫🇷 Ligue 1": "soccer_france_ligue_1"
+    }
+    
+    selected_league = st.selectbox("Choose League", list(leagues.keys()))
+    
+    if st.button(f"Scan {selected_league} for Value"):
+        url = f"https://api.the-odds-api.com/v4/sports/{leagues[selected_league]}/odds/?apiKey={API_KEY}&regions=uk&markets=h2h"
+        
+        try:
+            res = requests.get(url)
+            data = res.json()
+            
+            if not data:
+                st.info("No upcoming matches found for this league.")
+            
+            for game in data:
+                if not game.get("bookmakers"): continue
+                
+                home = game["home_team"]
+                away = game["away_team"]
+                
+                # --- AI LOGIC ---
+                # Placeholder: In a real AI, we'd fetch actual xG data.
+                # Currently assumes a standard 1.7 vs 1.2 goal expectation.
+                probs = get_poisson_probs(1.7, 1.2) 
+                
+                bookie = game["bookmakers"][0]
+                odds_list = {o['name']: o['price'] for o in bookie['markets'][0]['outcomes']}
+                
+                h_odds = odds_list.get(home)
+                edge = (probs['home'] * h_odds) - 1 if h_odds else 0
+
+                if edge > 0.05: # Only show if > 5% Value
+                    st.markdown(f"### {home} vs {away}")
+                    st.write(f"**AI Win Prob:** {probs['home']:.1%} | **Bookie Odds:** {h_odds}")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button(f"✅ Bet {home}", key=f"bet_{home}"):
+                            # Log to DB
+                            conn = sqlite3.connect(DB_NAME)
+                            conn.execute("INSERT INTO bets (event, selection, odds, stake, status) VALUES (?,?,?,?,?)",
+                                         (f"{home} vs {away}", home, h_odds, bankroll * risk_factor, "PENDING"))
+                            conn.commit()
+                            # Send Alert
+                            send_telegram(f"🎯 VALUE BET FOUND!\n{home} vs {away}\nSelection: {home}\nOdds: {h_odds}\nEdge: {edge:.2%}")
+                            st.success("Bet Tracked & Telegram Sent!")
+                    st.divider()
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+# --- TAB 2: TRACKER ---
+with tabs[1]:
+    conn = sqlite3.connect(DB_NAME)
+    df = pd.read_sql_query("SELECT * FROM bets", conn)
+    if not df.empty:
+        st.dataframe(df, use_container_width=True)
+        if st.button("🗑️ Reset Tracker"):
+            conn.execute("DELETE FROM bets")
+            conn.commit()
+            st.rerun()
+    else:
+        st.write("No bets tracked yet.")
         st.error(f"Error fetching data: {e}")
         return []
 
